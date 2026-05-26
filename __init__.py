@@ -294,11 +294,95 @@ class HybridSearcher:
     """混合检索器：融合向量检索与 BM25 关键词检索
 
     对向量分数和 BM25 分数分别归一化到 [0, 1] 后，按配置权重加权融合。
+    支持可选的 Reranker 重排序（交叉编码器）。
     """
+    
+    # Reranker 缓存（类级别，线程安全）
+    _reranker_model = None
+    _reranker_lock = threading.Lock()
+    
+    @classmethod
+    def _load_reranker(cls, model_name: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"):
+        """加载交叉编码器 Reranker（延迟加载，线程安全）"""
+        if cls._reranker_model is not None:
+            return cls._reranker_model
+        
+        with cls._reranker_lock:
+            if cls._reranker_model is not None:
+                return cls._reranker_model
+            
+            try:
+                from sentence_transformers import CrossEncoder
+                logger.info("加载 Reranker 模型: %s", model_name)
+                cls._reranker_model = CrossEncoder(model_name, device="cpu")
+                logger.info("Reranker 模型加载完成")
+                return cls._reranker_model
+            except Exception as e:
+                logger.warning("Reranker 模型加载失败: %s，将跳过重排序", e)
+                return None
+    
+    @staticmethod
+    def _rerank_results(query: str, candidates: List[Dict], skills: Dict, top_k: int, reranker_model=None) -> List[Dict]:
+        """使用交叉编码器对候选结果重排序
+        
+        参数:
+            query: 查询文本
+            candidates: 候选结果列表（包含 name 和 score）
+            skills: 技能索引字典
+            top_k: 返回数量
+            reranker_model: 预加载的 Reranker 模型
+        
+        返回:
+            重排序后的结果列表
+        """
+        if not candidates or len(candidates) <= 1:
+            return candidates[:top_k]
+        
+        # 加载 Reranker
+        if reranker_model is None:
+            reranker_model = HybridSearcher._load_reranker()
+        
+        if reranker_model is None:
+            logger.debug("Reranker 不可用，返回原始结果")
+            return candidates[:top_k]
+        
+        try:
+            # 构造 (query, doc) 对
+            pairs = []
+            for item in candidates:
+                name = item["name"]
+                skill = skills.get(name, {})
+                # 使用技能名称 + 描述作为文档
+                doc = f"{name}: {skill.get('description', '')}"
+                pairs.append((query, doc))
+            
+            # 交叉编码器打分
+            scores = reranker_model.predict(pairs, show_progress_bar=False)
+            
+            # 重新排序
+            scored_candidates = []
+            for i, item in enumerate(candidates):
+                scored_candidates.append({
+                    **item,
+                    "rerank_score": float(scores[i]),
+                    "original_score": item["score"],
+                    "score": float(scores[i])  # 使用 Reranker 分数作为最终分数
+                })
+            
+            scored_candidates.sort(key=lambda x: x["rerank_score"], reverse=True)
+            
+            logger.debug("Reranker 重排序完成: %d 个候选，返回 top %d", len(candidates), top_k)
+            return scored_candidates[:top_k]
+            
+        except Exception as e:
+            logger.error("Reranker 重排序失败: %s，返回原始结果", e)
+            return candidates[:top_k]
 
-    def __init__(self, vector_weight: float = 0.7, bm25_weight: float = 0.3):
+    def __init__(self, vector_weight: float = 0.7, bm25_weight: float = 0.3, use_reranker: bool = True):
         self._vector_weight = vector_weight
         self._bm25_weight = bm25_weight
+        self._use_reranker = use_reranker
+        self._reranker_model = None
 
     @staticmethod
     def _normalize_scores(score_map: Dict[str, float]) -> Dict[str, float]:
@@ -376,6 +460,8 @@ _DEFAULT_CONFIG = {
     ],
     "vector_weight": 0.7,
     "bm25_weight": 0.3,
+    "use_reranker": True,  # 新增：是否启用 Reranker 重排序
+    "reranker_model": "cross-encoder/ms-marco-MiniLM-L-6-v2",  # 新增：Reranker 模型
     "query_cache_ttl": 300,
     "query_cache_max_size": 1000,
     "encode_timeout": 10,
@@ -802,14 +888,34 @@ def search_skills(query: str, top_k: int = None) -> List[Dict[str, Any]]:
 
     # 正常模式：混合融合
     try:
-        hybrid = HybridSearcher(vector_weight=vector_weight, bm25_weight=bm25_weight)
+        use_reranker = config.get("use_reranker", True)
+        reranker_model_name = config.get("reranker_model", "cross-encoder/ms-marco-MiniLM-L-6-v2")
+        
+        hybrid = HybridSearcher(vector_weight=vector_weight, bm25_weight=bm25_weight, use_reranker=use_reranker)
+        
+        # 加载 Reranker 模型（如果启用）
+        reranker_model = None
+        if use_reranker:
+            reranker_model = hybrid._load_reranker(reranker_model_name)
+        
         fused = hybrid.search(
             query=query,
-            top_k=top_k,
+            top_k=top_k * 2,  # 先检索更多候选
             vector_results=vector_results,
             bm25_results=bm25_results,
             skill_names=skill_names,
         )
+        
+        # 使用 Reranker 重排序（如果启用且可用）
+        if use_reranker and reranker_model is not None:
+            fused = hybrid._rerank_results(
+                query=query,
+                candidates=fused,
+                skills=skills,
+                top_k=top_k,
+                reranker_model=reranker_model
+            )
+            logger.info("Reranker 重排序完成: %d 个结果", len(fused))
 
         results = []
         for item in fused:
